@@ -1,0 +1,7 @@
+LIBRARY dinput8
+EXPORTS
+  DirectInput8Create=Proxy_DirectInput8Create @1
+  Fear3Fix_TestRewrite @100
+  Fear3Fix_Status @101
+  Fear3Fix_TestFovInstall @102
+  Fear3Fix_FovApplied @103
