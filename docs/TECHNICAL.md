@@ -125,3 +125,41 @@ leaves a possession. This happens in solo and in co-op.
   - nothing happens without `-fov`;
   - `this`, the arguments and `esi`/`edi`/`ebx` are preserved over 100 calls.
 - In game (Paxton, co-op): the FOV stays at the `-fov` value through sprints and possessions.
+
+## Microphone toggle (v1.2)
+
+### What the game does
+
+- Voice goes through the Steamworks v1.13 voice API (`ISteamUser::GetVoice`). `Despair::VoiceMgr` (vtable
+  `0x019642F0`) runs an update every frame: slot 1, `0x005D1DA0`, which calls `0x00659630`.
+- `0x00659630` reads a push-to-talk key at `VoiceMgr+0xC`:
+  - `0`: the voice is always sent (open mic);
+  - otherwise, `GetAsyncKeyState(key)`. While the key is held, the voice is sent and Steam is told the player is
+    speaking (`ISteamFriends::SetInGameVoiceSpeaking`). When it is up, the recorded voice is discarded and Steam is
+    told the player is not speaking.
+- At startup, `0x00CB48A0` sets the key to 0. Then, unless `-noptt` is given, it reads Steam's
+  `config\localconfig.vdf` (found via `ISteamUser::GetUserDataFolder`) and loads `PushToTalkKey` only if
+  `UsePushToTalk` is non-zero. Today's Steam no longer writes `UsePushToTalk`, so the key stays 0 and the mic is
+  always open.
+
+### The fix
+
+- Same technique as the FOV fix: the slot 1 **pointer** of the `VoiceMgr` vtable (in a writable section) is replaced
+  by a transparent stub (`pushfd; pushad; push ecx; call VoiceCheck; add esp, 4; popad; popfd; jmp [original]`),
+  after checking that it holds `0x005D1DA0`. No code byte is modified.
+- `VoiceCheck(voiceMgr)`, before each update:
+  - `hold`: write the configured key to `+0xC`. This is the game's own push-to-talk.
+  - `toggle`: a press of the key (rising edge, counted only when the foreground window belongs to the game) flips
+    the state. On: write `0` (the game's open-mic path). Off: write `0x07`, an unassigned virtual-key code that is
+    never down, so the game discards the voice. Optional 70 ms beep on a thread-pool thread.
+- Without a `[voice]` section (ini from v1.1 or older) the mode is `open` and nothing is installed.
+
+### Validation
+
+- Test harness with a fake `VoiceMgr` vtable:
+  - toggle: off at start (`0x07`), first press → on (`0`), held key → no extra switch, second press → off, third → on;
+  - hold: the game sees the configured key;
+  - key names (letters, F-keys, mouse buttons, numpad, hex codes, unknown names rejected);
+  - `this`, the argument and `esi`/`edi`/`ebx` are preserved.
+- In game (co-op): the friend does not hear the player at start, hears them after a press of V, and no longer
+  hears them after a second press.

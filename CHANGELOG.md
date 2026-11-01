@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2
+
+- New: microphone toggle. Press V (changeable with `key=` in the `[voice]` section of `fear3fix.ini`) to turn the
+  mic on or off, instead of the always-open mic. The mic starts off, and a short beep tells you the new state.
+- Other modes: `mode=hold` (push-to-talk) and `mode=open` (original always-open mic). An ini from an older version,
+  without a `[voice]` section, keeps the original always-open mic.
+
 ## v1.1
 
 - New: FOV fix for Paxton Fettel. The `-fov:N` launch option is now re-applied to the cameras the game creates

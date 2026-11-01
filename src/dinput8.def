@@ -5,3 +5,6 @@ EXPORTS
   Fear3Fix_Status @101
   Fear3Fix_TestFovInstall @102
   Fear3Fix_FovApplied @103
+  Fear3Fix_TestVoiceInstall @104
+  Fear3Fix_TestVoiceKey @105
+  Fear3Fix_TestParseKey @106

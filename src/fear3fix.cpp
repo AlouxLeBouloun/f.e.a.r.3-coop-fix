@@ -3,8 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
-#define FEAR3FIX_VERSION "1.1"
+#pragma comment(lib, "user32.lib")
+
+#define FEAR3FIX_VERSION "1.2"
 
 struct CallbackMsg_t {
 	int m_hSteamUser;
@@ -24,6 +27,8 @@ typedef bool(__cdecl *PFN_BGetCallback)(int hSteamPipe, CallbackMsg_t *pMsg);
 typedef FARPROC(WINAPI *PFN_GetProcAddress)(HMODULE, LPCSTR);
 typedef HRESULT(WINAPI *PFN_DirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID *, void *);
 
+enum VoiceMode { kVoiceOpen, kVoiceHold, kVoiceToggle };
+
 static struct Config {
 	bool enabled;
 	bool fov;
@@ -31,6 +36,10 @@ static struct Config {
 	int reasons[16];
 	int nReasons;
 	char reasonsText[64];
+	VoiceMode voiceMode;
+	int voiceKey;
+	char voiceKeyText[32];
+	bool voiceSound;
 } g_cfg;
 
 static char g_dir[MAX_PATH];
@@ -72,6 +81,47 @@ static void Log(const char *fmt, ...)
 
 /* ---------- config ---------- */
 
+static int ParseKey(const char *s)
+{
+	static const struct { const char *name; int vk; } kNames[] = {
+		{ "MOUSE3", VK_MBUTTON }, { "MOUSE4", VK_XBUTTON1 }, { "MOUSE5", VK_XBUTTON2 },
+		{ "SPACE", VK_SPACE }, { "TAB", VK_TAB }, { "CAPSLOCK", VK_CAPITAL }, { "ENTER", VK_RETURN },
+		{ "BACKSPACE", VK_BACK }, { "SHIFT", VK_SHIFT }, { "LSHIFT", VK_LSHIFT }, { "RSHIFT", VK_RSHIFT },
+		{ "CTRL", VK_CONTROL }, { "LCTRL", VK_LCONTROL }, { "RCTRL", VK_RCONTROL },
+		{ "ALT", VK_MENU }, { "LALT", VK_LMENU }, { "RALT", VK_RMENU },
+		{ "INSERT", VK_INSERT }, { "DELETE", VK_DELETE }, { "HOME", VK_HOME }, { "END", VK_END },
+		{ "PAGEUP", VK_PRIOR }, { "PAGEDOWN", VK_NEXT }, { "UP", VK_UP }, { "DOWN", VK_DOWN },
+		{ "LEFT", VK_LEFT }, { "RIGHT", VK_RIGHT }, { "PAUSE", VK_PAUSE }, { "SCROLLLOCK", VK_SCROLL },
+		{ "NUMLOCK", VK_NUMLOCK }, { "MULTIPLY", VK_MULTIPLY }, { "ADD", VK_ADD }, { "SUBTRACT", VK_SUBTRACT },
+		{ "DECIMAL", VK_DECIMAL }, { "DIVIDE", VK_DIVIDE },
+		{ "`", VK_OEM_3 }, { "-", VK_OEM_MINUS }, { "=", VK_OEM_PLUS }, { "[", VK_OEM_4 }, { "]", VK_OEM_6 },
+		{ ";", VK_OEM_1 }, { "'", VK_OEM_7 }, { ",", VK_OEM_COMMA }, { ".", VK_OEM_PERIOD }, { "/", VK_OEM_2 },
+		{ "\\", VK_OEM_5 },
+	};
+	char k[32];
+	int n = 0;
+	for (; s[n] && n < 31; n++)
+		k[n] = (char)toupper((unsigned char)s[n]);
+	k[n] = 0;
+	if (n == 1 && ((k[0] >= 'A' && k[0] <= 'Z') || (k[0] >= '0' && k[0] <= '9')))
+		return k[0];
+	if (k[0] == 'F' && n >= 2 && n <= 3) {
+		int f = atoi(k + 1);
+		if (f >= 1 && f <= 24)
+			return VK_F1 + f - 1;
+	}
+	if (strncmp(k, "NUMPAD", 6) == 0 && n == 7 && k[6] >= '0' && k[6] <= '9')
+		return VK_NUMPAD0 + (k[6] - '0');
+	if (k[0] == '0' && k[1] == 'X') {
+		long v = strtol(k + 2, NULL, 16);
+		return v > 0 && v < 0xFF ? (int)v : 0;
+	}
+	for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); i++)
+		if (strcmp(k, kNames[i].name) == 0)
+			return kNames[i].vk;
+	return 0;
+}
+
 static void LoadConfig()
 {
 	char ini[MAX_PATH];
@@ -79,6 +129,12 @@ static void LoadConfig()
 	g_cfg.enabled = GetPrivateProfileIntA("fix", "enabled", 1, ini) != 0;
 	g_cfg.log = GetPrivateProfileIntA("fix", "log", 1, ini) != 0;
 	g_cfg.fov = GetPrivateProfileIntA("fov", "enabled", 1, ini) != 0;
+	char mode[16];
+	GetPrivateProfileStringA("voice", "mode", "open", mode, sizeof(mode), ini);
+	g_cfg.voiceMode = _stricmp(mode, "toggle") == 0 ? kVoiceToggle : _stricmp(mode, "hold") == 0 ? kVoiceHold : kVoiceOpen;
+	GetPrivateProfileStringA("voice", "key", "V", g_cfg.voiceKeyText, sizeof(g_cfg.voiceKeyText), ini);
+	g_cfg.voiceKey = ParseKey(g_cfg.voiceKeyText);
+	g_cfg.voiceSound = GetPrivateProfileIntA("voice", "sound", 1, ini) != 0;
 	GetPrivateProfileStringA("fix", "reasons", "12", g_cfg.reasonsText, sizeof(g_cfg.reasonsText), ini);
 	g_cfg.nReasons = 0;
 	char tmp[64];
@@ -262,6 +318,17 @@ static void __cdecl FovCheck(unsigned char *cam)
 	}
 }
 
+static bool SwapVtableSlot(void **slot, void *hook, void **orig)
+{
+	DWORD old;
+	if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
+		return false;
+	*orig = *slot;
+	InterlockedExchangePointer(slot, hook);
+	VirtualProtect(slot, sizeof(void *), old, &old);
+	return true;
+}
+
 static __declspec(naked) void Hook_PerFrame()
 {
 	__asm {
@@ -291,16 +358,12 @@ static bool InstallFovHook(void **vt, float *fovOption, bool checkExpected)
 		Log("FOV : vtable caméra illisible : correctif FOV INACTIF");
 		return false;
 	}
-	DWORD old;
-	if (!VirtualProtect(&vt[kSlotPerFrame], sizeof(void *), PAGE_READWRITE, &old)) {
+	g_setAdjusted = (PFN_SetAdjustedFov)vt[kSlotSetAdjusted];
+	g_fovOption = fovOption;
+	if (!SwapVtableSlot(&vt[kSlotPerFrame], (void *)Hook_PerFrame, &g_origPerFrame)) {
 		Log("FOV : VirtualProtect a échoué (%lu) : correctif FOV INACTIF", GetLastError());
 		return false;
 	}
-	g_setAdjusted = (PFN_SetAdjustedFov)vt[kSlotSetAdjusted];
-	g_fovOption = fovOption;
-	g_origPerFrame = vt[kSlotPerFrame];
-	InterlockedExchangePointer(&vt[kSlotPerFrame], (void *)Hook_PerFrame);
-	VirtualProtect(&vt[kSlotPerFrame], sizeof(void *), old, &old);
 	Log("FOV : slot 43 de la vtable caméra %p remplacé (origine %p) ; -fov actuel = %.1f", (void *)vt, g_origPerFrame,
 		*fovOption);
 	return true;
@@ -318,10 +381,116 @@ static void InstallFovFixForGame()
 	InstallFovHook(kCamVtable, kFovOption, true);
 }
 
-static DWORD WINAPI FovFallbackThread(LPVOID)
+static void **const kVoiceVtable = (void **)0x019642F0;
+enum { kSlotVoiceUpdate = 1, kVoicePttKey = 0x0C };
+static void *const kExpectedVoiceUpdate = (void *)0x005D1DA0;
+enum { kVkNeverPressed = 0x07 };
+
+static void *g_origVoiceUpdate;
+static volatile LONG g_voiceOn;
+static bool g_voiceKeyWasDown;
+static int g_testKeyState = -1;
+static volatile LONG g_voiceToggles;
+
+static bool GameInForeground()
+{
+	DWORD pid = 0;
+	HWND w = GetForegroundWindow();
+	return w && GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId();
+}
+
+static DWORD WINAPI BeepThread(LPVOID freq)
+{
+	Beep((DWORD)(ULONG_PTR)freq, 70);
+	return 0;
+}
+
+static void __cdecl VoiceCheck(unsigned char *voiceMgr)
+{
+	__try {
+		int *key = (int *)(voiceMgr + kVoicePttKey);
+		if (g_cfg.voiceMode == kVoiceHold) {
+			*key = g_cfg.voiceKey;
+			return;
+		}
+		bool down = g_testKeyState >= 0 ? g_testKeyState != 0
+			: (GetAsyncKeyState(g_cfg.voiceKey) & 0x8000) != 0 && GameInForeground();
+		if (down && !g_voiceKeyWasDown) {
+			LONG on = !g_voiceOn;
+			InterlockedExchange(&g_voiceOn, on);
+			LONG n = InterlockedIncrement(&g_voiceToggles);
+			if (n <= 500)
+				Log("micro %s (touche %s)", on ? "ACTIF" : "COUPÉ", g_cfg.voiceKeyText);
+			if (g_cfg.voiceSound)
+				QueueUserWorkItem(BeepThread, (LPVOID)(ULONG_PTR)(on ? 880 : 440), WT_EXECUTEDEFAULT);
+		}
+		g_voiceKeyWasDown = down;
+		*key = g_voiceOn ? 0 : kVkNeverPressed;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+}
+
+static __declspec(naked) void Hook_VoiceUpdate()
+{
+	__asm {
+		pushfd
+		pushad
+		push ecx
+		call VoiceCheck
+		add esp, 4
+		popad
+		popfd
+		jmp dword ptr [g_origVoiceUpdate]
+	}
+}
+
+static bool InstallVoiceHook(void **vt, bool checkExpected)
+{
+	if (g_origVoiceUpdate)
+		return true;
+	__try {
+		if (checkExpected && vt[kSlotVoiceUpdate] != kExpectedVoiceUpdate) {
+			Log("micro : vtable VoiceMgr inattendue (slot 1 = %p) : réglage du micro INACTIF (autre version du jeu ?)",
+				vt[kSlotVoiceUpdate]);
+			return false;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		Log("micro : vtable VoiceMgr illisible : réglage du micro INACTIF");
+		return false;
+	}
+	if (!SwapVtableSlot(&vt[kSlotVoiceUpdate], (void *)Hook_VoiceUpdate, &g_origVoiceUpdate)) {
+		Log("micro : VirtualProtect a échoué (%lu) : réglage du micro INACTIF", GetLastError());
+		return false;
+	}
+	Log("micro : slot 1 de la vtable VoiceMgr %p remplacé (origine %p) ; mode %s, touche %s (0x%02X)%s", (void *)vt,
+		g_origVoiceUpdate, g_cfg.voiceMode == kVoiceToggle ? "bascule (coupé au départ)" : "push-to-talk",
+		g_cfg.voiceKeyText, g_cfg.voiceKey, g_cfg.voiceSound ? ", bip" : "");
+	return true;
+}
+
+static void InstallVoiceFixForGame()
+{
+	static volatile LONG tried;
+	if (!g_cfg.enabled || g_cfg.voiceMode == kVoiceOpen || InterlockedExchange(&tried, 1))
+		return;
+	if (!g_cfg.voiceKey) {
+		Log("micro : touche \"%s\" inconnue dans fear3fix.ini : micro laissé ouvert", g_cfg.voiceKeyText);
+		return;
+	}
+	if (GetModuleHandleA(NULL) != (HMODULE)0x00400000) {
+		Log("micro : exe chargé ailleurs qu'en 0x400000 : réglage du micro INACTIF");
+		return;
+	}
+	InstallVoiceHook(kVoiceVtable, true);
+}
+
+static DWORD WINAPI VtableFallbackThread(LPVOID)
 {
 	Sleep(20000);
 	InstallFovFixForGame();
+	InstallVoiceFixForGame();
 	return 0;
 }
 
@@ -329,6 +498,7 @@ extern "C" HRESULT WINAPI Proxy_DirectInput8Create(HINSTANCE hinst, DWORD ver, R
 {
 	static PFN_DirectInput8Create real;
 	InstallFovFixForGame();
+	InstallVoiceFixForGame();
 	if (!real) {
 		char path[MAX_PATH];
 		UINT n = GetSystemDirectoryA(path, MAX_PATH);
@@ -368,6 +538,26 @@ extern "C" int __cdecl Fear3Fix_FovApplied()
 	return (int)g_fovApplied;
 }
 
+extern "C" int __cdecl Fear3Fix_TestVoiceInstall(void **vt, int mode, int vk)
+{
+	g_cfg.voiceMode = (VoiceMode)mode;
+	g_cfg.voiceKey = vk;
+	strcpy_s(g_cfg.voiceKeyText, "test");
+	g_cfg.voiceSound = false;
+	return InstallVoiceHook(vt, false) ? 1 : 0;
+}
+
+extern "C" int __cdecl Fear3Fix_TestParseKey(const char *name)
+{
+	return ParseKey(name);
+}
+
+extern "C" int __cdecl Fear3Fix_TestVoiceKey(int keyState)
+{
+	g_testKeyState = keyState;
+	return (int)g_voiceOn;
+}
+
 extern "C" int __cdecl Fear3Fix_Status()
 {
 	return (int)g_status | (g_cfg.enabled ? 0x100 : 0) | ((int)g_rewrites << 16);
@@ -389,15 +579,16 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
 
 	char exe[MAX_PATH];
 	GetModuleFileNameA(NULL, exe, MAX_PATH);
-	Log("fear3fix %s chargé dans %s ; enabled=%d reasons=%s fov=%d", FEAR3FIX_VERSION, exe, g_cfg.enabled ? 1 : 0,
-		g_cfg.reasonsText, g_cfg.fov ? 1 : 0);
+	static const char *const kModeNames[] = { "open", "hold", "toggle" };
+	Log("fear3fix %s chargé dans %s ; enabled=%d reasons=%s fov=%d voice=%s key=%s", FEAR3FIX_VERSION, exe,
+		g_cfg.enabled ? 1 : 0, g_cfg.reasonsText, g_cfg.fov ? 1 : 0, kModeNames[g_cfg.voiceMode], g_cfg.voiceKeyText);
 	if (!g_cfg.enabled) {
 		Log("correctif désactivé (fear3fix.ini) : simple proxy dinput8");
 		return TRUE;
 	}
 
-	if (g_cfg.fov && GetModuleHandleA(NULL) == (HMODULE)0x00400000) {
-		HANDLE t = CreateThread(NULL, 0, FovFallbackThread, NULL, 0, NULL);
+	if ((g_cfg.fov || g_cfg.voiceMode != kVoiceOpen) && GetModuleHandleA(NULL) == (HMODULE)0x00400000) {
+		HANDLE t = CreateThread(NULL, 0, VtableFallbackThread, NULL, 0, NULL);
 		if (t)
 			CloseHandle(t);
 	}
